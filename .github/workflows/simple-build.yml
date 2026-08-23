@@ -1,0 +1,67 @@
+name: Simple Multi-Platform Build
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build Windows
+      run: cargo build --release
+      working-directory: prc-editor-rust
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: prc-editor-windows
+        path: prc-editor-rust/target/release/prc-editor-rust.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-apple-darwin
+    - name: Build macOS Intel
+      run: cargo build --release
+      working-directory: prc-editor-rust
+    - name: Build macOS Apple Silicon
+      run: cargo build --release --target aarch64-apple-darwin
+      working-directory: prc-editor-rust
+    - name: Upload macOS Intel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: prc-editor-macos-intel
+        path: prc-editor-rust/target/release/prc-editor-rust
+    - name: Upload macOS Apple Silicon artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: prc-editor-macos-arm64
+        path: prc-editor-rust/target/aarch64-apple-darwin/release/prc-editor-rust
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgtk-3-dev libxdo-dev
+    - name: Build Linux
+      run: cargo build --release
+      working-directory: prc-editor-rust
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: prc-editor-linux
+        path: prc-editor-rust/target/release/prc-editor-rust 

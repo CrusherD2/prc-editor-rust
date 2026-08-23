@@ -1,0 +1,8 @@
+/target/
+/.prc_cache/
+**/*.rs.bk
+Cargo.lock.bak
+prc_editor_config.txt
+ParamLabels.csv
+.DS_Store
+Thumbs.db

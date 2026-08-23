@@ -8,6 +8,7 @@ This project is a Rust rewrite that **heavily uses the original PRC editor** as 
 
 - Original library and **prcEditor**: [BenHall-7/paracobNET](https://github.com/BenHall-7/paracobNET) by Benjamin Hall
 - Parameter labels: [ultimate-research/param-labels](https://github.com/ultimate-research/param-labels)
+- This Rust version was built with the use of AI (Cursor)
 
 The original `prcEditor` is the Windows C# TreeView / DataGrid tool this version is based on. Hash40 parsing, label handling, and most of the editor behavior were modeled directly after that project. This repo would not exist without that work.
 

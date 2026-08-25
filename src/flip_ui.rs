@@ -147,7 +147,7 @@ pub fn show_flip_preview(
             preview.apply_pending = true;
         }
         ui.label(
-            egui::RichText::new("Left = 180° + trans XYZ + flip.prc")
+            egui::RichText::new("Left = 180° + trans XYZ (listed) + flip.prc")
                 .small()
                 .color(egui::Color32::GRAY),
         );

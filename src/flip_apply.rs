@@ -78,7 +78,7 @@ pub fn apply_pose_and_flip(
     original_modl: Option<&ModlData>,
 ) {
     // Files face +Z. Smash yaws 90° onto stage X. Facing left is another 180°
-    // on every fighter; flip.prc (if any) then mirrors the listed bone axes.
+    // on every fighter; flip.prc then mirrors listed bone axes / trans deltas.
     let orient = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
     let model_transform = if facing_left {
         Mat4::from_rotation_y(std::f32::consts::PI) * orient
@@ -106,8 +106,8 @@ pub fn apply_pose_and_flip(
     let hlpb = model.find_hlpb();
 
     if facing_left {
-        // Skip helper constraints on left: they would overwrite the system-wide
-        // XYZ translation flip on every bone (including HaveL/HaveR).
+        // Skip helper constraints on left: they would overwrite the engine
+        // XYZ translation flip on flip.prc-listed bones (including HaveL/HaveR).
         render_model.apply_anims_with_skel_edit(
             queue,
             anims.iter().copied(),
@@ -148,9 +148,10 @@ pub fn remap_flip_mesh_pairs(meshes: &mut [RenderMesh], flip: &FlipPrc, facing_l
 }
 
 fn apply_flip_anim_pairs(bones: &mut [(usize, AnimatedBone)], flip: &FlipPrc) {
-    // Facing left: Smash mirrors every bone's animation translation on X/Y/Z.
+    // Facing left: Smash mirrors animation translation on X/Y/Z, but only for
+    // bones that appear in flip.prc. Unlisted bones keep their normal anim.
     // PRC trans flags still cancel axes on listed entries afterward.
-    apply_engine_trans_flip(bones);
+    apply_engine_trans_flip(bones, flip);
     for entry in flip.flip_bones.iter().chain(&flip.pair_bones) {
         remap_pair_anim(bones, entry);
     }
@@ -194,8 +195,19 @@ fn remap_single_anim(bones: &mut [(usize, AnimatedBone)], entry: &FlipEntry) {
     bones[i].1.set_current_trs(t, r, s);
 }
 
-fn apply_engine_trans_flip(bones: &mut [(usize, AnimatedBone)]) {
+fn apply_engine_trans_flip(bones: &mut [(usize, AnimatedBone)], flip: &FlipPrc) {
+    let listed: std::collections::HashSet<String> = flip
+        .affected_bone_names()
+        .into_iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    if listed.is_empty() {
+        return;
+    }
     for i in 0..bones.len() {
+        if !listed.contains(&bones[i].1.name().to_ascii_lowercase()) {
+            continue;
+        }
         let rest = bones[i].1.rest_trs();
         let cur = bones[i].1.current_trs();
         let d = cur.0 - rest.0;

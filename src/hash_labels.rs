@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 
 // CRC32 table from paracobNET
@@ -214,14 +214,7 @@ impl HashLabels {
         let Some(path) = &self.persist_path else {
             return;
         };
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "0x{hash:X},{label}");
-        }
+        let _ = append_label_lines(path, std::iter::once((hash, label)));
     }
 
     /// Add a new label and automatically generate its hash
@@ -244,22 +237,17 @@ impl HashLabels {
         hash
     }
 
-    /// Save all labels to a CSV file
-    pub fn save_to_csv(&self, file_path: &str) -> Result<()> {
-        use std::fs::File;
-        use std::io::Write;
-        
-        let mut file = File::create(file_path)?;
-        
-        // Sort by hash for consistent output
-        let mut sorted_labels: Vec<_> = self.labels.iter().collect();
-        sorted_labels.sort_by_key(|(hash, _)| *hash);
-        
-        for (hash, label) in sorted_labels {
-            writeln!(file, "0x{:X},{}", hash, label)?;
-        }
-        
-        Ok(())
+    /// Append labels that are not already in the CSV. Never rewrites or reorders existing lines.
+    pub fn save_to_csv(&self, file_path: &str) -> Result<usize> {
+        let existing = csv_entry_set(file_path)?;
+        let mut missing: Vec<(u64, &str)> = self
+            .labels
+            .iter()
+            .filter(|(hash, label)| !existing.contains(&(**hash, (*label).clone())))
+            .map(|(hash, label)| (*hash, label.as_str()))
+            .collect();
+        missing.sort_by_key(|(hash, _)| *hash);
+        Ok(append_label_lines(file_path, missing)?)
     }
 
     /// Add a new label and save to CSV file if provided
@@ -313,8 +301,156 @@ impl HashLabels {
     }
 }
 
+fn parse_csv_hash(hash_str: &str) -> Option<u64> {
+    let normalized = if hash_str.starts_with("0x") || hash_str.starts_with("0X") {
+        let hex_part = &hash_str[2..];
+        let trimmed = hex_part.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        hash_str.to_string()
+    };
+    u64::from_str_radix(&normalized, 16).ok()
+}
+
+fn csv_entry_set(file_path: &str) -> Result<HashSet<(u64, String)>> {
+    let mut existing = HashSet::new();
+    let content = match std::fs::read_to_string(file_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(existing),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(content.as_bytes());
+    for result in reader.records() {
+        let record = result?;
+        if record.len() == 2 {
+            if let (Some(hash_str), Some(label)) = (record.get(0), record.get(1)) {
+                if let Some(hash) = parse_csv_hash(hash_str) {
+                    existing.insert((hash, label.to_string()));
+                }
+            }
+        }
+    }
+    Ok(existing)
+}
+
+fn ensure_trailing_newline(path: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut buf = [0u8; 1];
+    file.read_exact(&mut buf)?;
+    if buf[0] != b'\n' {
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+    }
+    Ok(())
+}
+
+fn append_label_lines<'a, I>(file_path: &str, lines: I) -> std::io::Result<usize>
+where
+    I: IntoIterator<Item = (u64, &'a str)>,
+{
+    use std::io::Write;
+
+    let mut count = 0usize;
+    let mut pending: Vec<(u64, String)> = Vec::new();
+    for (hash, label) in lines {
+        pending.push((hash, label.to_string()));
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_trailing_newline(file_path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_path)?;
+    for (hash, label) in pending {
+        writeln!(file, "0x{hash:X},{label}")?;
+        count += 1;
+    }
+    file.flush()?;
+    Ok(count)
+}
+
 impl Default for HashLabels {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_csv(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "prc_editor_{name}_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn persist_appends_after_existing_lines() {
+        let path = temp_csv("append");
+        std::fs::write(&path, "0x1,existing\n0x2,also").unwrap();
+
+        let mut labels = HashLabels::new();
+        labels
+            .load_from_csv("0x1,existing\n0x2,also")
+            .unwrap();
+        labels.set_persist_path(Some(path.to_string_lossy().into_owned()));
+        labels.add_label("brand_new");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            content.starts_with("0x1,existing\n0x2,also\n"),
+            "original lines must stay at the top: {content:?}"
+        );
+        assert!(content.contains("brand_new"));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn save_to_csv_does_not_rewrite_existing_file() {
+        let path = temp_csv("save");
+        std::fs::write(&path, "0x10,z_last\n0x1,a_first\n").unwrap();
+
+        let mut labels = HashLabels::new();
+        labels
+            .load_from_csv("0x10,z_last\n0x1,a_first\n")
+            .unwrap();
+        labels.add_label_for_hash(0x99, "new_one");
+        let appended = labels.save_to_csv(path.to_str().unwrap()).unwrap();
+        assert_eq!(appended, 1);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(content.starts_with("0x10,z_last\n0x1,a_first\n"));
+        assert!(content.contains("0x99,new_one"));
+        assert_eq!(content.matches("z_last").count(), 1);
     }
 } 

@@ -406,10 +406,16 @@ impl PrcEditorApp {
                 
                 if ui.button("Save").clicked() {
                     if let Some(path) = &self.param_labels_path {
-                        // Save to the current path
                         match self.param_file.hash_labels.save_to_csv(path) {
-                            Ok(()) => {
-                                self.status_message = format!("Labels saved to {}", path);
+                            Ok(0) => {
+                                self.status_message = format!(
+                                    "No new labels to append; existing ParamLabels.csv was left unchanged ({path})"
+                                );
+                            }
+                            Ok(n) => {
+                                self.status_message = format!(
+                                    "Appended {n} new labels to the end of {path}"
+                                );
                             }
                             Err(e) => {
                                 self.status_message = format!("Error saving labels: {}", e);
@@ -2403,13 +2409,13 @@ impl PrcEditorApp {
         if hits.is_empty() {
             return 0;
         }
+        if let Some(path) = self.param_labels_path.clone() {
+            self.param_file.hash_labels.set_persist_path(Some(path));
+        }
         for hit in hits {
             self.param_file
                 .hash_labels
                 .add_label_for_hash(hit.hash, &hit.label);
-        }
-        if let Some(path) = self.param_labels_path.clone() {
-            let _ = self.param_file.hash_labels.save_to_csv(&path);
         }
         self.param_file.rebuild_tree_with_labels();
         self.invalidate_label_list_cache();

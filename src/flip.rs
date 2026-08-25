@@ -531,6 +531,59 @@ fn list_field_hash(file: &ParamFile, list_name: &str) -> Option<u64> {
     })
 }
 
+/// Create an empty list field on the flip.prc root when the category is missing.
+fn ensure_flip_list(file: &mut ParamFile, list_name: &str) -> bool {
+    if list_field_hash(file, list_name).is_some() {
+        return true;
+    }
+    let Some(root) = file.root.as_mut() else {
+        return false;
+    };
+    let ParamValue::Struct(root_struct) = &mut root.value else {
+        return false;
+    };
+    let field_hash = file.hash_labels.add_label(list_name);
+    root_struct.fields.insert(
+        field_hash,
+        ParamValue::List(ParamList {
+            values: Vec::new(),
+        }),
+    );
+    true
+}
+
+fn list_last_value(file: &ParamFile, list_name: &str) -> Option<ParamValue> {
+    let hash = list_field_hash(file, list_name)?;
+    let root = file.get_root()?;
+    let ParamValue::Struct(root_struct) = &root.value else {
+        return None;
+    };
+    let ParamValue::List(list) = root_struct.fields.get(&hash)? else {
+        return None;
+    };
+    list.values.last().cloned()
+}
+
+fn entry_template(file: &ParamFile, list_name: &str) -> Option<ParamValue> {
+    if let Some(value) = list_last_value(file, list_name) {
+        return Some(value);
+    }
+    let kind = FlipListKind::for_category(list_name);
+    let flip = FlipPrc::from_param_file(file)?;
+    for name in flip.category_names() {
+        if name == list_name {
+            continue;
+        }
+        if FlipListKind::for_category(&name) != kind {
+            continue;
+        }
+        if let Some(value) = list_last_value(file, &name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn with_list_mut<R>(
     file: &mut ParamFile,
     list_name: &str,
@@ -606,15 +659,33 @@ fn apply_entry_to_value(value: &mut ParamValue, entry: &FlipEntry, labels: &mut 
     }
 }
 
-fn new_entry_value(entry: &FlipEntry, template: Option<&ParamValue>, labels: &mut HashLabels) -> ParamValue {
+fn new_entry_value(
+    list_name: &str,
+    entry: &FlipEntry,
+    template: Option<&ParamValue>,
+    labels: &mut HashLabels,
+) -> ParamValue {
     if let Some(template) = template {
         let mut value = template.clone();
         apply_entry_to_value(&mut value, entry, labels);
         return value;
     }
-    match FlipListKind::for_category("flip_bones") {
-        _ if entry.rhs_name.is_none() => ParamValue::Hash(labels.add_label(&entry.lhs_name)),
-        _ => {
+    let kind = FlipListKind::for_category(list_name);
+    match kind {
+        FlipListKind::BoneSingles => ParamValue::Hash(labels.add_label(&entry.lhs_name)),
+        FlipListKind::MeshPairs | FlipListKind::MaterialPairs => {
+            if let Some(rhs) = &entry.rhs_name {
+                ParamValue::List(ParamList {
+                    values: vec![
+                        ParamValue::Hash(labels.add_label(&entry.lhs_name)),
+                        ParamValue::Hash(labels.add_label(rhs)),
+                    ],
+                })
+            } else {
+                ParamValue::Hash(labels.add_label(&entry.lhs_name))
+            }
+        }
+        FlipListKind::BonePairs => {
             let mut fields = indexmap::IndexMap::new();
             fields.insert(
                 labels.add_label("trans"),
@@ -659,9 +730,12 @@ pub fn update_flip_entry(file: &mut ParamFile, list_name: &str, index: usize, en
 }
 
 pub fn append_flip_entry(file: &mut ParamFile, list_name: &str, entry: &FlipEntry) -> bool {
+    if !ensure_flip_list(file, list_name) {
+        return false;
+    }
+    let template = entry_template(file, list_name);
     let ok = with_list_mut(file, list_name, |list, labels| {
-        let template = list.values.last().cloned();
-        let value = new_entry_value(entry, template.as_ref(), labels);
+        let value = new_entry_value(list_name, entry, template.as_ref(), labels);
         list.values.push(value);
         true
     })

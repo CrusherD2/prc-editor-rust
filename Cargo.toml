@@ -1,7 +1,12 @@
 [package]
 name = "prc-editor-rust"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "Prc-Editor"
+path = "src/main.rs"
 
 [dependencies]
 # Core dependencies that work on both desktop and Switch
@@ -14,11 +19,22 @@ indexmap = { version = "2.0", features = ["serde"] }
 
 # Desktop-only dependencies (disabled for Switch builds)
 [target.'cfg(not(target_os = "horizon"))'.dependencies]
-egui = "0.28"
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }
 rfd = "0.14"
 dirs = "5.0"
 rayon = "1.8"
+raw-window-handle = "0.6"
+winit = "0.30"
+ureq = "2.12"
+serde_json = "1.0"
+semver = "1.0"
+chrono = "0.4"
+wgpu = "29.0.1"
+glam = { version = "0.28.0", features = ["bytemuck"] }
+ssbh_data = { version = "0.19.0", features = ["strum"] }
+ssbh_wgpu = { path = "../../SSBH Editor MAIN/ssbh_editor-main/vendor/ssbh_wgpu/ssbh_wgpu" }
 
 # Switch-specific dependencies
 [target.'cfg(target_os = "horizon")'.dependencies]
@@ -29,4 +45,4 @@ winres = "0.1"
 
 [profile.release]
 opt-level = 2
-strip = true 
+strip = true

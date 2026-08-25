@@ -7,7 +7,7 @@ A Windows desktop editor for Smash Ultimate parameter files (`.prc`, `.prcx`, `.
 This project is a Rust rewrite that **heavily uses the original PRC editor** as its reference for file format, UI layout, and editing workflow.
 
 - Original library and **prcEditor**: [BenHall-7/paracobNET](https://github.com/BenHall-7/paracobNET) by Benjamin Hall
-- Parameter labels: [ultimate-research/param-labels](https://github.com/ultimate-research/param-labels)
+- Parameter labels: [CrusherD2/param-labels](https://github.com/CrusherD2/param-labels) (fork of [ultimate-research/param-labels](https://github.com/ultimate-research/param-labels))
 - This Rust version was built with the use of AI (Cursor)
 
 The original `prcEditor` is the Windows C# TreeView / DataGrid tool this version is based on. Hash40 parsing, label handling, and most of the editor behavior were modeled directly after that project. This repo would not exist without that work.
@@ -25,7 +25,7 @@ The original `prcEditor` is the Windows C# TreeView / DataGrid tool this version
 
 Grab the Windows executable from [Releases](https://github.com/CrusherD2/prc-editor-rust/releases).
 
-You also need [ParamLabels.csv](https://github.com/ultimate-research/param-labels) for readable names. The editor will prompt you to load it.
+You also need [ParamLabels.csv](https://github.com/CrusherD2/param-labels) for readable names. The editor downloads it automatically, or you can use **Labels > Download**.
 
 ## Build from source
 
@@ -37,7 +37,7 @@ cd prc-editor-rust
 cargo build --release
 ```
 
-The binary is written to `target/release/prc-editor-rust.exe`.
+The binary is written to `target/release/Prc-Editor.exe`.
 
 ## Usage
 

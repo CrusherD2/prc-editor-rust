@@ -1,10 +1,15 @@
+﻿use crate::flip_ui::{show_flip_preview, show_tab_bar};
+use crate::hash_crack::{self, CrackHit};
 use crate::param_file::ParamFile;
 use crate::param_types::*;
+use crate::update::{self, LatestReleaseInfo, UpdateDownload};
+use crate::viewport::{FlipPreviewState, MainTab};
 use eframe::egui;
 use rfd::FileDialog;
 use std::collections::{HashSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::alloc::GlobalAlloc;
+use std::thread::JoinHandle;
 
 // Debug logging
 #[cfg(debug_assertions)]
@@ -49,6 +54,7 @@ pub struct PrcEditorApp {
     request_edit_focus: bool, // Request focus on the editing text box on the next frame it appears
     new_label_input: String, // For adding new labels
     new_hash_input: String, // For adding labels to existing hashes
+    hash_guess_input: String, // Try a name against hashed values in the open file
     label_page: usize, // Current page in label editor
     labels_per_page: usize, // Number of labels per page
     label_list_cache: Vec<(u64, String)>, // Sorted, filtered labels for the editor
@@ -83,6 +89,19 @@ pub struct PrcEditorApp {
     enable_node_caching: bool, // Enable node caching
     max_tree_depth: usize, // Maximum tree depth to render
     max_visible_items: usize, // Maximum visible items in lists
+    flip_preview: FlipPreviewState,
+    crack_job: Option<JoinHandle<CrackJobResult>>,
+    release_info: LatestReleaseInfo,
+    update_download: UpdateDownload,
+    update_status_message: Option<String>,
+    auto_download_updates: bool,
+}
+
+struct CrackJobResult {
+    hits: Vec<CrackHit>,
+    leftover: Vec<u64>,
+    unknown_count: usize,
+    model_name_count: usize,
 }
 
 #[derive(Clone)]
@@ -132,6 +151,7 @@ impl PrcEditorApp {
             request_edit_focus: false,
             new_label_input: String::new(),
             new_hash_input: String::new(),
+            hash_guess_input: String::new(),
             label_page: 1,
             labels_per_page: 10,
             label_list_cache: Vec::new(),
@@ -162,63 +182,108 @@ impl PrcEditorApp {
             enable_node_caching: true,
             max_tree_depth: 8,
             max_visible_items: 100,
+            flip_preview: FlipPreviewState::default(),
+            crack_job: None,
+            release_info: update::check_for_updates(),
+            update_download: UpdateDownload::default(),
+            update_status_message: None,
+            auto_download_updates: update::load_auto_download_updates(),
         };
         
-        // Load saved labels path if available
-        if let Some(saved_path) = app.load_saved_labels_path() {
-            app.param_labels_path = Some(saved_path.clone());
-            app.load_labels_from_content(&std::fs::read_to_string(&saved_path).unwrap_or_default(), &saved_path);
-        }
+        // Load ParamLabels.csv from AppData\Roaming\Smash Ultimate Labels, downloading it if needed.
+        app.ensure_param_labels();
         
         app
     }
-    
-    fn load_param_labels(&mut self) {
-        // First try to load from a previously saved path
-        if let Some(saved_path) = self.load_saved_labels_path() {
-            if Path::new(&saved_path).exists() {
-                match std::fs::read_to_string(&saved_path) {
-                    Ok(csv_content) => {
-                        self.param_labels_path = Some(saved_path.clone());
-                        let file_name = Path::new(&saved_path)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("ParamLabels.csv");
-                        self.load_labels_from_content(&csv_content, file_name);
-                        return;
-                    }
-                    Err(_) => {
-                        self.status_message = format!("Could not read saved ParamLabels.csv at: {}", saved_path);
-                    }
-                }
-            } else {
-                self.status_message = format!("Saved ParamLabels.csv path no longer exists: {}", saved_path);
-            }
-        }
-        
-        // Try to load from the default location
-        if let Ok(csv_content) = std::fs::read_to_string("ParamLabels.csv") {
-            self.param_labels_path = Some("ParamLabels.csv".to_string());
-            self.load_labels_from_content(&csv_content, "ParamLabels.csv");
-            // Save this path for next time
-            self.save_labels_path("ParamLabels.csv");
-        } else {
-            // Try to find it in the Blender addon directory
-            if let Some(blender_dir) = Self::find_blender_addon_directory() {
-                let mut param_labels_path = blender_dir;
-                param_labels_path.push("ParamLabels.csv");
-                
-                if let Ok(csv_content) = std::fs::read_to_string(&param_labels_path) {
-                    let path_string = param_labels_path.to_string_lossy().to_string();
-                    self.param_labels_path = Some(path_string.clone());
-                    self.load_labels_from_content(&csv_content, "ParamLabels.csv");
-                    self.save_labels_path(&path_string);
+
+    const PARAM_LABELS_URL: &'static str =
+        "https://raw.githubusercontent.com/CrusherD2/param-labels/master/ParamLabels.csv";
+
+    fn smash_ultimate_labels_dir() -> Option<PathBuf> {
+        let mut dir = dirs::config_dir()?;
+        dir.push("Smash Ultimate Labels");
+        Some(dir)
+    }
+
+    fn default_param_labels_path() -> Option<PathBuf> {
+        let mut path = Self::smash_ultimate_labels_dir()?;
+        path.push("ParamLabels.csv");
+        Some(path)
+    }
+
+    fn ensure_param_labels(&mut self) {
+        if let Some(path) = Self::default_param_labels_path() {
+            if path.exists() {
+                if self.load_labels_file(&path) {
                     return;
                 }
+            } else if self.download_param_labels_file(&path) {
+                return;
             }
-            
-            // If not found anywhere, prompt user to select the file (required)
-            self.status_message = "ParamLabels.csv is required - please select location".to_string();
+        }
+
+        if let Some(saved) = self.load_saved_labels_path() {
+            let saved_path = PathBuf::from(&saved);
+            if saved_path.exists() && self.load_labels_file(&saved_path) {
+                return;
+            }
+        }
+
+        self.status_message =
+            "ParamLabels.csv could not be loaded. Use Labels > Download or Load Labels...".to_string();
+    }
+
+    fn load_labels_file(&mut self, path: &Path) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(content) if !content.trim().is_empty() => {
+                let path_string = path.to_string_lossy().to_string();
+                self.param_labels_path = Some(path_string.clone());
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("ParamLabels.csv");
+                self.load_labels_from_content(&content, file_name);
+                self.save_labels_path(&path_string);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn download_param_labels_file(&mut self, path: &Path) -> bool {
+        self.status_message = format!("Downloading ParamLabels.csv to {}…", path.display());
+        match Self::fetch_param_labels_csv(path) {
+            Ok(()) => self.load_labels_file(path),
+            Err(e) => {
+                self.status_message = e;
+                false
+            }
+        }
+    }
+
+    fn fetch_param_labels_csv(path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
+        }
+        let response = ureq::get(Self::PARAM_LABELS_URL)
+            .timeout(std::time::Duration::from_secs(60))
+            .call()
+            .map_err(|e| format!("Download failed: {e}"))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes)
+            .map_err(|e| format!("Download failed: {e}"))?;
+        if bytes.is_empty() {
+            return Err("Downloaded ParamLabels.csv was empty.".to_string());
+        }
+        std::fs::write(path, bytes)
+            .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+        Ok(())
+    }
+
+    fn load_param_labels(&mut self) {
+        self.ensure_param_labels();
+        if self.param_labels_path.is_none() {
             self.prompt_for_labels_file();
         }
     }
@@ -238,21 +303,17 @@ impl PrcEditorApp {
     }
     
     fn prompt_for_labels_file(&mut self) {
-        // Try to find the Blender addon directory as default
         let mut dialog = FileDialog::new()
             .add_filter("CSV files", &["csv"])
             .add_filter("All files", &["*"])
-            .set_title("Select ParamLabels.csv file (REQUIRED)")
+            .set_title("Select ParamLabels.csv file")
             .set_file_name("ParamLabels.csv");
-        
-        // Set default directory to Blender addon if found
-        if let Some(blender_dir) = Self::find_blender_addon_directory() {
-            dialog = dialog.set_directory(&blender_dir);
-            self.status_message = format!("Please select ParamLabels.csv (defaulting to Blender addon directory: {})", blender_dir.display());
-        } else {
-            self.status_message = "Please select ParamLabels.csv file (Blender addon directory not found)".to_string();
+
+        if let Some(labels_dir) = Self::smash_ultimate_labels_dir() {
+            let _ = std::fs::create_dir_all(&labels_dir);
+            dialog = dialog.set_directory(&labels_dir);
         }
-        
+
         if let Some(file_path) = dialog.pick_file() {
             match std::fs::read_to_string(&file_path) {
                 Ok(csv_content) => {
@@ -281,13 +342,13 @@ impl PrcEditorApp {
     }
 
     fn show_menu_bar(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) {
-        egui::menu::bar(ui, |ui| {
+        egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 let has_labels = self.param_labels_path.is_some();
                 let open_button = ui.add_enabled(has_labels, egui::Button::new("Open"));
                 if open_button.clicked() {
                     self.open_file_dialog();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if !has_labels && open_button.hovered() {
                     open_button.on_hover_text("Load ParamLabels.csv first");
@@ -298,24 +359,24 @@ impl PrcEditorApp {
                 let has_file = self.param_file.get_root().is_some();
                 if ui.add_enabled(has_file, egui::Button::new("Save")).clicked() {
                     self.save_file();
-                    ui.close_menu();
+                    ui.close();
                 }
                 
                 if ui.add_enabled(has_file, egui::Button::new("Save As...")).clicked() {
                     self.save_file_dialog();
-                    ui.close_menu();
+                    ui.close();
                 }
             });
 
             ui.menu_button("Labels", |ui| {
                 if ui.button("Load Labels...").clicked() {
                     self.prompt_for_labels_file();
-                    ui.close_menu();
+                    ui.close();
                 }
                 
                 if ui.button("Change Location...").clicked() {
                     self.prompt_for_labels_file();
-                    ui.close_menu();
+                    ui.close();
                 }
                 
                 ui.separator();
@@ -340,7 +401,7 @@ impl PrcEditorApp {
                     self.show_label_editor = true;
                     self.label_page = 1;
                     self.invalidate_label_list_cache();
-                    ui.close_menu();
+                    ui.close();
                 }
                 
                 if ui.button("Save").clicked() {
@@ -357,23 +418,74 @@ impl PrcEditorApp {
                     } else {
                         self.status_message = "No labels file path set - use 'Load Labels...' first".to_string();
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 
                 if ui.button("Download").clicked() {
                     self.download_labels();
-                    ui.close_menu();
+                    ui.close();
+                }
+
+                let has_file = self.param_file.get_root().is_some();
+                if ui
+                    .add_enabled(
+                        has_file && self.crack_job.is_none(),
+                        egui::Button::new("Crack hashes in this file"),
+                    )
+                    .on_hover_text("Test ParamLabels words, the loaded model names, and short brute-force against unresolved 0x hashes")
+                    .clicked()
+                {
+                    self.crack_open_file();
+                    ui.close();
+                }
+            });
+
+            ui.menu_button("Help", |ui| {
+                if ui.button("Check for Updates").clicked() {
+                    let info = update::check_for_updates_now();
+                    update::apply_manual_update_check(
+                        info,
+                        &mut self.release_info,
+                        &self.update_download,
+                        self.auto_download_updates,
+                        &mut self.update_status_message,
+                    );
+                    ui.close();
+                }
+
+                if ui
+                    .checkbox(
+                        &mut self.auto_download_updates,
+                        "Automatically Download Updates",
+                    )
+                    .on_hover_text(
+                        "When a new version is available, download it next to this program. Close PRC Editor and run the new file to update.",
+                    )
+                    .changed()
+                {
+                    update::save_auto_download_updates(self.auto_download_updates);
+                }
+
+                ui.separator();
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                if ui.button("GitHub Releases").clicked() {
+                    update::open_releases_page();
+                    ui.close();
+                }
+                if ui.button("Report Issue").clicked() {
+                    update::open_issues_page();
+                    ui.close();
                 }
             });
         });
     }
 
     fn show_main_content(&mut self, ui: &mut egui::Ui) {
-        egui::SidePanel::left("parameter_tree")
+        egui::Panel::left("parameter_tree")
             .resizable(true)
-            .default_width(self.tree_width)
-            .min_width(200.0)
-            .show_inside(ui, |ui| {
+            .default_size(self.tree_width)
+            .min_size(200.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Parameter Tree");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -419,7 +531,10 @@ impl PrcEditorApp {
                             ui.add_space(10.0);
                             ui.label("This editor requires ParamLabels.csv to function properly.");
                             ui.add_space(5.0);
-                            if ui.button("Select ParamLabels.csv").clicked() {
+                            if ui.button("Download ParamLabels.csv").clicked() {
+                                self.ensure_param_labels();
+                            }
+                            if ui.button("Load from file...").clicked() {
                                 self.prompt_for_labels_file();
                             }
                         });
@@ -441,7 +556,7 @@ impl PrcEditorApp {
                 });
             });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Parameter Details");
             ui.separator();
             
@@ -468,15 +583,15 @@ impl PrcEditorApp {
             );
             
             // Draw the shortcuts box as overlay (non-interactive background element)
-            ui.allocate_ui_at_rect(
-                egui::Rect::from_min_size(shortcuts_pos, egui::vec2(shortcuts_box_width, shortcuts_box_height)),
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(shortcuts_pos, egui::vec2(shortcuts_box_width, shortcuts_box_height))),
                 |ui| {
                     // Background frame
                     let frame = egui::Frame::default()
                         .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 200))
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 80, 80, 150)))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(12.0));
+                        .corner_radius(8.0)
+                        .inner_margin(12.0);
                     
                     frame.show(ui, |ui| {
                         ui.vertical(|ui| {
@@ -565,7 +680,7 @@ impl PrcEditorApp {
                 
                 if is_keyboard_selected && !is_selected {
                     let rect = label_response.rect;
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW));
+                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW), egui::StrokeKind::Inside);
                 }
                 
                 label_response
@@ -619,7 +734,7 @@ impl PrcEditorApp {
                 
                 if is_keyboard_selected && !is_selected {
                     let rect = label_response.rect;
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW));
+                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW), egui::StrokeKind::Inside);
                 }
                 
                 label_response
@@ -644,7 +759,7 @@ impl PrcEditorApp {
                 
                 if is_keyboard_selected && !is_selected {
                     let rect = label_response.rect;
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW));
+                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW), egui::StrokeKind::Inside);
                 }
                 
                 label_response
@@ -847,7 +962,7 @@ impl PrcEditorApp {
             let mut new_editing_value = self.editing_value.clone();
             let mut new_status_message = None;
             
-            egui::ScrollArea::vertical().id_source("bones_scroll_area").max_height(300.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("bones_scroll_area").max_height(300.0).show(ui, |ui| {
                 egui::Grid::new("bones_list")
                     .num_columns(3)
                     .striped(true)
@@ -1265,7 +1380,7 @@ impl PrcEditorApp {
             total_fields
         };
         
-        egui::ScrollArea::vertical().id_source("struct_fields_scroll_area").max_height(400.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("struct_fields_scroll_area").max_height(400.0).show(ui, |ui| {
             egui::Grid::new("struct_fields")
                 .num_columns(5)
                 .striped(true)
@@ -1341,7 +1456,7 @@ impl PrcEditorApp {
                         ui.monospace(format!("0x{:X}", child.hash));
                         
                         // Type column with dropdown
-                        egui::ComboBox::from_id_source(format!("type_{}", i))
+                        egui::ComboBox::from_id_salt(format!("type_{}", i))
                             .selected_text(child.get_type_name())
                             .show_ui(ui, |ui| {
                                 let types = ["bool", "sbyte", "byte", "short", "ushort", "int", "uint", "float", "hash40", "string", "list", "struct"];
@@ -1352,7 +1467,7 @@ impl PrcEditorApp {
                                 }
                             });
                         
-                        // Value column — bools use a checkbox like the original PRC editor
+                        // Value column â€” bools use a checkbox like the original PRC editor
                         let is_editing = new_editing_value.as_ref()
                             .map(|(path, _)| path == &child_path)
                             .unwrap_or(false);
@@ -1571,7 +1686,7 @@ impl PrcEditorApp {
         let mut new_editing_value = self.editing_value.clone();
         let mut new_status_message = None;
         
-        egui::ScrollArea::vertical().id_source("list_items_scroll_area").max_height(400.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("list_items_scroll_area").max_height(400.0).show(ui, |ui| {
             egui::Grid::new("list_items")
                 .num_columns(4)
                 .striped(true)
@@ -1591,7 +1706,7 @@ impl PrcEditorApp {
                         ui.label(i.to_string());
                         
                         // Type column with dropdown
-                        egui::ComboBox::from_id_source(format!("list_type_{}", i))
+                        egui::ComboBox::from_id_salt(format!("list_type_{}", i))
                             .selected_text(child.get_type_name())
                             .show_ui(ui, |ui| {
                                 let types = ["bool", "sbyte", "byte", "short", "ushort", "int", "uint", "float", "hash40", "string", "list", "struct"];
@@ -1691,7 +1806,7 @@ impl PrcEditorApp {
                 ui.strong("Type:");
                 
                 // Type dropdown
-                egui::ComboBox::from_id_source("value_type")
+                egui::ComboBox::from_id_salt("value_type")
                     .selected_text(node.get_type_name())
                     .show_ui(ui, |ui| {
                         let types = ["bool", "sbyte", "byte", "short", "ushort", "int", "uint", "float", "hash40", "string", "list", "struct"];
@@ -2116,7 +2231,9 @@ impl PrcEditorApp {
     }
 
     fn open_file_dialog(&mut self) {
-        // Check if ParamLabels.csv is loaded first
+        if self.param_labels_path.is_none() {
+            self.ensure_param_labels();
+        }
         if self.param_labels_path.is_none() {
             self.status_message = "Please load ParamLabels.csv first before opening parameter files".to_string();
             self.prompt_for_labels_file();
@@ -2167,6 +2284,7 @@ impl PrcEditorApp {
                                 debug_log!("Rebuilding tree with labels");
                                 self.param_file.rebuild_tree_with_labels();
                             }
+                            self.on_param_file_opened();
                         }
                         Err(e) => {
                             debug_log!("File parse failed: {}", e);
@@ -2179,6 +2297,21 @@ impl PrcEditorApp {
                 Err(e) => {
                     debug_log!("File read failed: {}", e);
                     self.status_message = format!("Error reading file: {}", e);
+                }
+            }
+        }
+    }
+
+    fn on_param_file_opened(&mut self) {
+        self.flip_preview.apply_pending = true;
+        if crate::flip::is_flip_prc(&self.param_file, self.current_file_path.as_deref()) {
+            if let Some(path) = self
+                .current_file_path
+                .as_ref()
+                .and_then(|p| crate::flip::suggested_model_folder(p))
+            {
+                if path.exists() {
+                    self.flip_preview.load_model_folder(path);
                 }
             }
         }
@@ -2229,8 +2362,208 @@ impl PrcEditorApp {
     }
 
     fn download_labels(&mut self) {
-        // TODO: Implement label downloading from online source
-        self.status_message = "Label downloading not yet implemented".to_string();
+        if let Some(path) = Self::default_param_labels_path() {
+            let _ = self.download_param_labels_file(&path);
+        } else {
+            self.status_message =
+                "Could not find AppData/Roaming to store ParamLabels.csv".to_string();
+        }
+    }
+
+    fn unresolved_in_open_file(&self) -> Vec<u64> {
+        let mut hashes = std::collections::HashSet::new();
+        if let Some(root) = self.param_file.get_root() {
+            hash_crack::collect_hashes(&root.value, &mut hashes);
+        }
+        hash_crack::unresolved_hashes(&self.param_file.hash_labels, &hashes)
+    }
+
+    fn extra_crack_names(&self) -> Vec<String> {
+        let mut names = self.flip_preview.dictionary_names();
+        let mut folders = Vec::new();
+        if let Some(path) = &self.current_file_path {
+            if let Some(motion) = crate::flip::suggested_motion_folder(path) {
+                folders.push(motion);
+            } else if let Some(parent) = path.parent() {
+                folders.push(parent.to_path_buf());
+            }
+        }
+        if let Some(model_path) = &self.flip_preview.model_path {
+            if !folders.iter().any(|folder| folder == model_path) {
+                folders.push(model_path.clone());
+            }
+        }
+        names.extend(FlipPreviewState::anim_names_from_folders(&folders));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn apply_crack_hits(&mut self, hits: &[CrackHit]) -> usize {
+        if hits.is_empty() {
+            return 0;
+        }
+        for hit in hits {
+            self.param_file
+                .hash_labels
+                .add_label_for_hash(hit.hash, &hit.label);
+        }
+        if let Some(path) = self.param_labels_path.clone() {
+            let _ = self.param_file.hash_labels.save_to_csv(&path);
+        }
+        self.param_file.rebuild_tree_with_labels();
+        self.invalidate_label_list_cache();
+        self.flip_preview.apply_pending = true;
+        self.tree_items_dirty = true;
+        hits.len()
+    }
+
+    fn crack_open_file(&mut self) {
+        if self.crack_job.is_some() {
+            return;
+        }
+        let targets = self.unresolved_in_open_file();
+        if targets.is_empty() {
+            self.status_message = "No unresolved hashes in this file.".to_string();
+            return;
+        }
+        let extra = self.extra_crack_names();
+        let model_name_count = extra.len();
+        let known: Vec<String> = self
+            .param_file
+            .hash_labels
+            .get_all_labels()
+            .values()
+            .cloned()
+            .collect();
+        let unknown_count = targets.len();
+        let model_note = if model_name_count == 0 {
+            " (no Flip Preview model loaded)"
+        } else {
+            ""
+        };
+        self.status_message = format!(
+            "Cracking {unknown_count} hashed values against {model_name_count} model names{model_note}…"
+        );
+        self.crack_job = Some(std::thread::spawn(move || {
+            let hits = hash_crack::crack_hashes(&known, &targets, &extra);
+            let leftover: Vec<u64> = targets
+                .iter()
+                .copied()
+                .filter(|hash| !hits.iter().any(|hit| hit.hash == *hash))
+                .collect();
+            CrackJobResult {
+                hits,
+                leftover,
+                unknown_count,
+                model_name_count,
+            }
+        }));
+    }
+
+    fn poll_crack_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.crack_job.take() else {
+            return;
+        };
+        if !job.is_finished() {
+            self.crack_job = Some(job);
+            ctx.request_repaint();
+            return;
+        }
+        match job.join() {
+            Ok(result) => self.finish_crack_result(result),
+            Err(_) => self.status_message = "Hash cracker failed.".to_string(),
+        }
+    }
+
+    fn finish_crack_result(&mut self, result: CrackJobResult) {
+        let names: Vec<String> = result
+            .hits
+            .iter()
+            .map(|hit| format!("{} ({})", hit.label, hit.source))
+            .collect();
+        let model_hits: Vec<&str> = result
+            .hits
+            .iter()
+            .filter(|hit| hit.source == "model")
+            .map(|hit| hit.label.as_str())
+            .collect();
+        let leftover_text = if result.leftover.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Still hashed: {}.",
+                hash_crack::format_leftover(&result.leftover)
+            )
+        };
+        let model_text = if result.model_name_count == 0 {
+            " No Flip Preview model was loaded, so bones/meshes/materials were not checked."
+                .to_string()
+        } else if model_hits.is_empty() {
+            format!(
+                " Checked {} names from the loaded model; none matched a leftover hash.",
+                result.model_name_count
+            )
+        } else {
+            let shown = model_hits
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = if model_hits.len() > 8 { "…" } else { "" };
+            format!(
+                " Matched from model ({} names): {shown}{more}.",
+                result.model_name_count
+            )
+        };
+        let n = self.apply_crack_hits(&result.hits);
+        let unknown_count = result.unknown_count;
+        if n == 0 {
+            self.status_message = format!(
+                "Could not reverse {unknown_count} hashes.{model_text}{leftover_text} These are probably PRC list/field names (not bones/meshes). Hash40 of length 14+ cannot be brute-forced; try Guess with a snake_case name of that exact length."
+            );
+        } else {
+            let shown = names.iter().take(12).cloned().collect::<Vec<_>>().join(", ");
+            let more = if names.len() > 12 { "…" } else { "" };
+            let path_display = self
+                .param_labels_path
+                .as_deref()
+                .unwrap_or("ParamLabels.csv");
+            self.status_message = format!(
+                "Cracked {n} of {unknown_count}: {shown}{more}. Saved to {path_display}.{model_text}{leftover_text}"
+            );
+        }
+    }
+
+    fn try_hash_guess(&mut self) {
+        let guess = self.hash_guess_input.clone();
+        let targets = self.unresolved_in_open_file();
+        if targets.is_empty() {
+            self.status_message = "No unresolved hashes in this file to test.".to_string();
+            return;
+        }
+        if let Some(hit) = hash_crack::try_guess(&targets, &guess) {
+            let label = hit.label.clone();
+            let hash = hit.hash;
+            self.apply_crack_hits(&[hit]);
+            let path_display = self
+                .param_labels_path
+                .as_deref()
+                .unwrap_or("ParamLabels.csv");
+            self.status_message = format!(
+                "Guess '{label}' matches 0x{hash:X} and was saved to {path_display}"
+            );
+            self.hash_guess_input.clear();
+        } else {
+            let hash = crate::hash_labels::HashLabels::hash40(guess.trim());
+            let len = crate::hash_labels::HashLabels::hash40_length(hash);
+            self.status_message = format!(
+                "'{}' → 0x{:X} (length {len}) did not match any unresolved hash in this file.",
+                guess.trim(),
+                hash
+            );
+        }
     }
     
     /// Build a flattened list of visible tree items for keyboard navigation
@@ -2945,9 +3278,10 @@ impl PrcEditorApp {
     }
     
     /// Save the ParamLabels.csv path to a config file
-    fn save_labels_path(&self, path: &str) {
+    fn save_labels_path(&mut self, path: &str) {
         let config_path = Self::get_config_path();
         let _ = std::fs::write(&config_path, path);
+        self.param_file.hash_labels.set_persist_path(Some(path.to_string()));
     }
     
     /// Load the saved ParamLabels.csv path from the config file
@@ -3148,7 +3482,7 @@ impl PrcEditorApp {
                                         let is_selected = selected_index == Some(i);
                                         let label_response = ui.add_sized(
                                             [ui.available_width(), 0.0],
-                                            egui::SelectableLabel::new(is_selected, suggestion),
+                                            egui::Button::selectable(is_selected, suggestion.as_str()),
                                         );
 
                                         if label_response.clicked() {
@@ -3290,6 +3624,27 @@ impl PrcEditorApp {
                 ui.horizontal(|ui| {
                     ui.label("Format: Hash (0x1133BC6DD8) + Label name");
                 });
+
+                ui.separator();
+                ui.label("Unhashing uses ParamLabels as a dictionary. Hash40 is CRC32 plus the name length, so a full reverse is impossible — guessing the right-length name is not.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.param_file.get_root().is_some() && self.crack_job.is_none(),
+                            egui::Button::new("Crack hashes in this file"),
+                        )
+                        .clicked()
+                    {
+                        self.crack_open_file();
+                    }
+                    ui.label("Guess a name:");
+                    let guess_resp = ui.text_edit_singleline(&mut self.hash_guess_input);
+                    let try_guess = ui.button("Try guess").clicked()
+                        || (guess_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if try_guess {
+                        self.try_hash_guess();
+                    }
+                });
                 
                 // Search input and pagination controls
                 self.ensure_label_list_cache();
@@ -3327,7 +3682,7 @@ impl PrcEditorApp {
                     
                     ui.separator();
                     ui.label("Per page:");
-                    egui::ComboBox::from_id_source("page_size")
+                    egui::ComboBox::from_id_salt("page_size")
                         .selected_text(self.labels_per_page.to_string())
                         .show_ui(ui, |ui| {
                             for &size in &[10, 25, 50, 100] {
@@ -3341,7 +3696,7 @@ impl PrcEditorApp {
                 
                 ui.separator();
                 
-                // Labels list — only the current page, in a bounded scroll area
+                // Labels list â€” only the current page, in a bounded scroll area
                 let list_height = (ui.available_height() - 36.0).clamp(160.0, 280.0);
                 let start_index = (self.label_page.saturating_sub(1)) * per_page;
                 let page_labels: Vec<(u64, String)> = self.label_list_cache
@@ -3376,7 +3731,7 @@ impl PrcEditorApp {
                                 
                                 ui.horizontal(|ui| {
                                     if ui.small_button("Copy").clicked() {
-                                        ui.output_mut(|o| o.copied_text = label.clone());
+                                        ui.ctx().copy_text(label.clone());
                                         self.status_message = format!("Copied: {}", label);
                                     }
                                     if ui.small_button("Delete").clicked() {
@@ -4066,7 +4421,7 @@ impl PrcEditorApp {
                 // Add visual indication for keyboard selection
                 if is_keyboard_selected && !is_selected {
                     let rect = label_response.rect;
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW));
+                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW), egui::StrokeKind::Inside);
                 }
                 
                 label_response
@@ -4095,7 +4450,7 @@ impl PrcEditorApp {
                 // Add visual indication for keyboard selection
                 if is_keyboard_selected && !is_selected {
                     let rect = label_response.rect;
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW));
+                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::YELLOW), egui::StrokeKind::Inside);
                 }
                 
                 label_response
@@ -4137,7 +4492,8 @@ impl PrcEditorApp {
 }
 
 impl eframe::App for PrcEditorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // Increment frame counter for performance tracking
         self.frame_count += 1;
         
@@ -4149,13 +4505,20 @@ impl eframe::App for PrcEditorApp {
         }
         
         // Handle keyboard shortcuts
-        self.handle_keyboard_shortcuts(ctx);
+        self.handle_keyboard_shortcuts(&ctx);
+        self.poll_crack_job(&ctx);
+
+        if self.flip_preview.tab == MainTab::FlipPreview {
+            ctx.request_repaint();
+        }
+
+        let wgpu_state = frame.wgpu_render_state();
         
         // Status bar at bottom using bottom panel - create this FIRST so main content knows about it
-        egui::TopBottomPanel::bottom("status_panel")
+        egui::Panel::bottom("status_panel")
             .resizable(false)
-            .min_height(25.0)
-            .show(ctx, |ui| {
+            .min_size(25.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Status:");
                     ui.label(&self.status_message);
@@ -4218,17 +4581,62 @@ impl eframe::App for PrcEditorApp {
             });
         
         // Main content area - now it knows about the status bar space
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Menu bar
-            self.show_menu_bar(ctx, ui);
+            self.show_menu_bar(&ctx, ui);
             
             ui.separator();
-            
-            // Main content area
-            self.show_main_content(ui);
+
+            show_tab_bar(
+                ui,
+                &mut self.flip_preview,
+                &self.param_file,
+                self.current_file_path.as_deref(),
+                self.param_file.get_root().is_some() && self.crack_job.is_none(),
+            );
+            ui.separator();
+
+            match self.flip_preview.tab {
+                MainTab::Editor => self.show_main_content(ui),
+                MainTab::FlipPreview => {
+                    show_flip_preview(
+                        ui,
+                        &mut self.flip_preview,
+                        &mut self.param_file,
+                        self.current_file_path.as_deref(),
+                        &mut self.status_message,
+                        wgpu_state,
+                    );
+                    if self.flip_preview.param_dirty {
+                        self.mark_tree_dirty();
+                        self.flip_preview.param_dirty = false;
+                    }
+                }
+            }
+            if self.flip_preview.request_crack {
+                self.flip_preview.request_crack = false;
+                self.crack_open_file();
+            }
         });
         
         // Show label editor window if open
-        self.show_label_editor_window(ctx);
+        self.show_label_editor_window(&ctx);
+        update::show_update_windows(
+            &ctx,
+            &mut self.release_info,
+            &self.update_download,
+            self.auto_download_updates,
+            &mut self.update_status_message,
+        );
     }
-} 
+
+    fn on_exit(&mut self) {
+        update::save_update_check_time(&self.release_info);
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Opaque dark fill. The eframe default is semi-transparent, which lets the
+        // white Win32 window background flash through on startup.
+        [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0]
+    }
+}

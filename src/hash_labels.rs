@@ -37,7 +37,7 @@ const CRC32_TABLE: [u32; 256] = [
     0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
 ];
 
-fn crc32(word: &str) -> u32 {
+pub fn crc32(word: &str) -> u32 {
     let mut hash = 0xffffffff;
     for byte in word.bytes() {
         hash = (hash >> 8) ^ CRC32_TABLE[((hash ^ byte as u32) & 0xff) as usize];
@@ -50,6 +50,7 @@ pub struct HashLabels {
     reverse_labels: HashMap<String, u64>,
     // Cache for hash_to_string lookups to improve performance
     hash_to_string_cache: std::cell::RefCell<HashMap<u64, String>>,
+    persist_path: Option<String>,
 }
 
 impl HashLabels {
@@ -58,6 +59,7 @@ impl HashLabels {
             labels: HashMap::new(),
             reverse_labels: HashMap::new(),
             hash_to_string_cache: std::cell::RefCell::new(HashMap::new()),
+            persist_path: None,
         }
     }
 
@@ -163,7 +165,6 @@ impl HashLabels {
         self.labels.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn get_all_labels(&self) -> &HashMap<u64, String> {
         &self.labels
     }
@@ -185,10 +186,42 @@ impl HashLabels {
 
     /// Generate Hash40 from string using the same algorithm as paracobNET
     /// Hash40 = (string_length << 32) | CRC32(string)
-    pub fn string_to_hash40(&self, word: &str) -> u64 {
+    pub fn hash40(word: &str) -> u64 {
         let length = word.len() as u64;
         let crc = crc32(word) as u64;
         (length << 32) | crc
+    }
+
+    /// Generate Hash40 from string using the same algorithm as paracobNET
+    /// Hash40 = (string_length << 32) | CRC32(string)
+    pub fn string_to_hash40(&self, word: &str) -> u64 {
+        Self::hash40(word)
+    }
+
+    pub fn is_unresolved(&self, hash: u64) -> bool {
+        hash != 0 && self.hash_to_string(hash).starts_with("0x")
+    }
+
+    pub fn hash40_length(hash: u64) -> usize {
+        ((hash >> 32) & 0xFF) as usize
+    }
+
+    pub fn set_persist_path(&mut self, path: Option<String>) {
+        self.persist_path = path;
+    }
+
+    fn persist_new_entry(&self, hash: u64, label: &str) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "0x{hash:X},{label}");
+        }
     }
 
     /// Add a new label and automatically generate its hash
@@ -206,6 +239,7 @@ impl HashLabels {
         
         // Clear cache since we added a new label
         self.hash_to_string_cache.borrow_mut().clear();
+        self.persist_new_entry(hash, label);
         
         hash
     }
@@ -230,13 +264,10 @@ impl HashLabels {
 
     /// Add a new label and save to CSV file if provided
     pub fn add_label_and_save(&mut self, label: &str, csv_path: Option<&str>) -> u64 {
-        let hash = self.add_label(label);
-        
         if let Some(path) = csv_path {
-            let _ = self.save_to_csv(path);
+            self.persist_path = Some(path.to_string());
         }
-        
-        hash
+        self.add_label(label)
     }
 
     /// Try to parse a string as either a hex hash or a label name
@@ -261,21 +292,23 @@ impl HashLabels {
 
     /// Add a label for an existing hash value
     pub fn add_label_for_hash(&mut self, hash: u64, label: &str) {
+        let is_new = self.labels.get(&hash).map(String::as_str) != Some(label);
         self.labels.insert(hash, label.to_string());
         self.reverse_labels.insert(label.to_string(), hash);
         
         // Clear cache since we added a new label
         self.hash_to_string_cache.borrow_mut().clear();
+        if is_new {
+            self.persist_new_entry(hash, label);
+        }
     }
 
     /// Add a label for an existing hash and save to CSV
     pub fn add_label_for_hash_and_save(&mut self, hash: u64, label: &str, csv_path: Option<&str>) -> Result<()> {
-        self.add_label_for_hash(hash, label);
-        
         if let Some(path) = csv_path {
-            self.save_to_csv(path)?;
+            self.persist_path = Some(path.to_string());
         }
-        
+        self.add_label_for_hash(hash, label);
         Ok(())
     }
 }

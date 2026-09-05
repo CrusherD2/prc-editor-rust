@@ -146,6 +146,15 @@ pub fn show_flip_preview(
             preview.facing_left = true;
             preview.apply_pending = true;
         }
+        if ui
+            .checkbox(&mut preview.always_face_camera, "Always face camera")
+            .on_hover_text(
+                "When facing left, rotate the model another 180° around Y so its front remains visible",
+            )
+            .changed()
+        {
+            preview.apply_pending = true;
+        }
         ui.label(
             egui::RichText::new("Left = 180° + trans XYZ (listed) + flip.prc")
                 .small()

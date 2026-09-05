@@ -190,6 +190,7 @@ pub enum MeshVisCommand {
 pub struct FlipPreviewState {
     pub tab: MainTab,
     pub facing_left: bool,
+    pub always_face_camera: bool,
     pub show_bones: bool,
     pub model_path: Option<PathBuf>,
     pub model: Option<ModelFolder>,
@@ -234,6 +235,7 @@ impl Default for FlipPreviewState {
         Self {
             tab: MainTab::Editor,
             facing_left: false,
+            always_face_camera: false,
             show_bones: false,
             model_path: None,
             model: None,
@@ -966,6 +968,7 @@ pub fn paint_viewport(
                     &state.shared_data,
                     flip,
                     preview.facing_left,
+                    preview.always_face_camera,
                     &anims,
                     preview.current_frame,
                     preview.original_modl.as_ref(),

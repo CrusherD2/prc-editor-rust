@@ -73,18 +73,24 @@ pub fn apply_pose_and_flip(
     shared_data: &SharedRenderData,
     flip: &FlipPrc,
     facing_left: bool,
+    always_face_camera: bool,
     anims: &[&AnimData],
     current_frame: f32,
     original_modl: Option<&ModlData>,
 ) {
     // Files face +Z. Smash yaws 90° onto stage X. Facing left is another 180°
     // on every fighter; flip.prc then mirrors listed bone axes / trans deltas.
+    // The camera-facing preview option adds a separate Y rotation after that
+    // gameplay transform, leaving the flip logic itself unchanged.
     let orient = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
-    let model_transform = if facing_left {
+    let mut model_transform = if facing_left {
         Mat4::from_rotation_y(std::f32::consts::PI) * orient
     } else {
         orient
     };
+    if facing_left && always_face_camera {
+        model_transform = Mat4::from_rotation_y(std::f32::consts::PI) * model_transform;
+    }
     render_model.set_model_transform(queue, model_transform);
     render_model.invert_winding = false;
 
